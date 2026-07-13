@@ -1,0 +1,669 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>HubLink Companion</title>
+<!--
+  HubLink Companion (web) — the iOS companion client, served as a static page (Cloudflare
+  Pages or any static host). Deliberately a single self-contained file: no build step, so
+  "deploy" is just uploading this file.
+
+  Speaks the exact same wire protocol as the native Android companion app and the HubLink TV
+  app's CompanionSignalingServer (see /companion-protocol/src/main/kotlin/com/hublink/companion
+  /protocol/CompanionProtocol.kt in the main repo — this file's message shapes are a hand-kept
+  mirror of that Kotlin source, not a generated one, so if that protocol changes, update both).
+
+  IMPORTANT — read before deploying, this is a real constraint, not a formality:
+  Cloudflare Pages serves this page over HTTPS. Browsers block a plain, insecure `ws://`
+  connection to a LAN device from an HTTPS page ("mixed content") — Safari on iOS enforces this
+  same as every other modern browser. That means straight out of the box, this page CANNOT
+  open a signaling connection to HubLink TV's local ws://<lan-ip>:<port> server the way the
+  Android companion app does. Two real fixes, neither implemented here yet:
+    1. Make HubLink TV's CompanionSignalingServer serve WSS (TLS) instead of plain WS — hard to
+       do cleanly for a self-signed cert on a dynamic LAN IP the phone has never seen before.
+    2. Put a small cloud relay in front (e.g. a Cloudflare Worker) that both this page and the
+       TV app connect to over WSS to exchange just the small SDP/ICE signaling messages — the
+       actual audio/video still flows directly device-to-device once the WebRTC connection is
+       established; only the initial handshake needs to leave the LAN. This is the standard
+       pattern most WebRTC apps use for exactly this problem and is the recommended next step.
+  Until one of those exists, this page will connect successfully on a network/setup where the
+  mixed-content restriction doesn't apply (e.g. this file served over plain HTTP on the same
+  LAN instead of via Cloudflare) but will fail to reach a LAN ws:// TV when deployed to Cloudflare
+  Pages as HTTPS. The on-screen error state below says so explicitly rather than hanging silently.
+-->
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0a0b14;
+    --bg-elevated: #14121f;
+    --surface: #1c1930;
+    --surface-focused: #2b2547;
+    --accent-start: #e1306c;
+    --accent-end: #5b8cff;
+    --text-primary: #f5f7fa;
+    --text-secondary: #a6adbb;
+    --danger: #ff6b6b;
+    --success: #34c759;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    background: linear-gradient(180deg, var(--bg-elevated), var(--bg));
+    color: var(--text-primary);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  #app {
+    min-height: 100dvh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    text-align: center;
+  }
+  .brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 28px;
+  }
+  .brand .mark {
+    width: 36px;
+    height: 36px;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-weight: 700;
+    color: white;
+  }
+  .brand .name { font-size: 18px; font-weight: 700; }
+  .brand .name .link { color: var(--text-primary); }
+  .brand .name .hub { background: linear-gradient(135deg, var(--accent-start), var(--accent-end)); -webkit-background-clip: text; background-clip: text; color: transparent; }
+
+  .card {
+    width: 100%;
+    max-width: 420px;
+    background: var(--surface);
+    border-radius: 20px;
+    padding: 24px;
+  }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  p.body { color: var(--text-secondary); font-size: 15px; line-height: 1.5; margin: 0 0 20px; }
+
+  video#scanVideo, video#previewVideo {
+    width: 100%;
+    aspect-ratio: 3 / 4;
+    border-radius: 16px;
+    background: black;
+    object-fit: cover;
+    transform: scaleX(-1);
+  }
+  video#scanVideo { transform: none; }
+
+  button {
+    font: inherit;
+    font-weight: 600;
+    border: none;
+    border-radius: 999px;
+    padding: 14px 24px;
+    cursor: pointer;
+    color: white;
+    background: linear-gradient(135deg, var(--accent-start), var(--accent-end));
+    width: 100%;
+    margin-top: 12px;
+  }
+  button.secondary {
+    background: var(--surface-focused);
+    color: var(--text-primary);
+  }
+  button:disabled { opacity: 0.5; cursor: default; }
+
+  .row { display: flex; align-items: center; justify-content: space-between; padding: 12px 0; border-top: 1px solid rgba(255,255,255,0.08); }
+  .row:first-of-type { border-top: none; }
+  .row .label { font-size: 15px; }
+  .row .sub { font-size: 12px; color: var(--text-secondary); }
+
+  .switch { position: relative; width: 46px; height: 28px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track { position: absolute; inset: 0; background: #3a3550; border-radius: 999px; transition: 0.15s; }
+  .switch .track::before { content: ""; position: absolute; width: 22px; height: 22px; left: 3px; top: 3px; background: white; border-radius: 50%; transition: 0.15s; }
+  .switch input:checked + .track { background: linear-gradient(135deg, var(--accent-start), var(--accent-end)); }
+  .switch input:checked + .track::before { transform: translateX(18px); }
+
+  .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+  .status-dot.ok { background: var(--success); }
+  .status-dot.warn { background: #f5c518; }
+  .status-dot.bad { background: var(--danger); }
+
+  .banner {
+    background: rgba(255, 107, 107, 0.12);
+    border: 1px solid rgba(255, 107, 107, 0.4);
+    color: var(--text-primary);
+    border-radius: 12px;
+    padding: 14px;
+    font-size: 13px;
+    line-height: 1.5;
+    text-align: left;
+    margin-top: 16px;
+  }
+  .hidden { display: none !important; }
+  .spinner {
+    width: 28px; height: 28px;
+    border: 3px solid rgba(255,255,255,0.2);
+    border-top-color: var(--accent-end);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin: 0 auto 16px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div id="app">
+  <div class="brand">
+    <div class="mark">H</div>
+    <div class="name"><span class="hub">Hub</span><span class="link">Link</span> Companion</div>
+  </div>
+
+  <!-- Scan state -->
+  <div id="scanCard" class="card">
+    <h1>Pair with your TV</h1>
+    <p class="body">Open HubLink on your Android TV, go to Telegram Calls, and point this camera at the QR code shown there.</p>
+    <video id="scanVideo" autoplay playsinline muted></video>
+    <canvas id="scanCanvas" class="hidden"></canvas>
+    <button id="requestCameraBtn">Allow camera access</button>
+    <div id="scanError" class="banner hidden"></div>
+  </div>
+
+  <!-- Connecting / reconnecting state -->
+  <div id="statusCard" class="card hidden">
+    <div class="spinner"></div>
+    <h1 id="statusTitle">Connecting…</h1>
+    <p class="body" id="statusBody"></p>
+  </div>
+
+  <!-- Connected state -->
+  <div id="connectedCard" class="card hidden">
+    <video id="previewVideo" autoplay playsinline muted></video>
+    <h1 style="margin-top:16px" id="connectedTitle">Connected</h1>
+    <p class="body"><span class="status-dot ok" id="qualityDot"></span><span id="qualityLabel">Good connection</span> · <span id="batteryLabel"></span></p>
+
+    <div class="row">
+      <div>
+        <div class="label">Camera</div>
+        <div class="sub" id="cameraSub">Streaming to TV</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="cameraToggle" checked />
+        <span class="track"></span>
+      </label>
+    </div>
+    <div class="row">
+      <div>
+        <div class="label">Microphone</div>
+        <div class="sub" id="micSub">Streaming to TV</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="micToggle" checked />
+        <span class="track"></span>
+      </label>
+    </div>
+
+    <button class="secondary" id="switchCameraBtn">Switch camera</button>
+    <button class="secondary" id="unpairBtn">Unpair</button>
+  </div>
+
+  <!-- Fatal / mixed-content error state -->
+  <div id="fatalCard" class="card hidden">
+    <h1>Can't reach your TV</h1>
+    <p class="body" id="fatalBody"></p>
+    <button class="secondary" id="fatalRetryBtn">Try again</button>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---------------------------------------------------------------------
+  // Wire protocol — hand-mirrors companion-protocol's CompanionProtocol.kt
+  // and CompanionMessageCodec.kt. Keep field names byte-for-byte identical
+  // to the Kotlin @Serializable data classes (kotlinx.serialization emits
+  // exact Kotlin property names; there are no @SerialName overrides there).
+  // ---------------------------------------------------------------------
+  const MessageType = {
+    PAIRING_HELLO: "PAIRING_HELLO",
+    PAIRING_ACCEPTED: "PAIRING_ACCEPTED",
+    PAIRING_REJECTED: "PAIRING_REJECTED",
+    DEVICE_STATUS: "DEVICE_STATUS",
+    DEVICE_SELECTION: "DEVICE_SELECTION",
+    SIGNALING_OFFER: "SIGNALING_OFFER",
+    SIGNALING_ANSWER: "SIGNALING_ANSWER",
+    SIGNALING_ICE_CANDIDATE: "SIGNALING_ICE_CANDIDATE",
+    DISCONNECT: "DISCONNECT"
+  };
+
+  function encode(type, fields) {
+    return JSON.stringify(Object.assign({ type: type }, fields));
+  }
+
+  function decode(raw) {
+    try {
+      const obj = JSON.parse(raw);
+      if (!obj || typeof obj.type !== "string") return null;
+      return obj;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function decodePairingPayload(raw) {
+    try {
+      const obj = JSON.parse(raw);
+      if (!obj || !obj.host || !obj.port || !obj.sessionId || !obj.pairingToken) return null;
+      return obj;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // Persistence — localStorage mirrors DeviceReconnectCredential so a
+  // reload auto-reconnects instead of re-scanning a QR code, matching the
+  // native companion apps' behavior.
+  // ---------------------------------------------------------------------
+  const STORAGE_KEY = "hublink_companion_credential";
+  function saveCredential(cred) { localStorage.setItem(STORAGE_KEY, JSON.stringify(cred)); }
+  function loadCredential() {
+    try { return JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch (e) { return null; }
+  }
+  function clearCredential() { localStorage.removeItem(STORAGE_KEY); }
+
+  // ---------------------------------------------------------------------
+  // DOM references
+  // ---------------------------------------------------------------------
+  const scanCard = document.getElementById("scanCard");
+  const statusCard = document.getElementById("statusCard");
+  const connectedCard = document.getElementById("connectedCard");
+  const fatalCard = document.getElementById("fatalCard");
+
+  const scanVideo = document.getElementById("scanVideo");
+  const scanCanvas = document.getElementById("scanCanvas");
+  const scanError = document.getElementById("scanError");
+  const requestCameraBtn = document.getElementById("requestCameraBtn");
+
+  const statusTitle = document.getElementById("statusTitle");
+  const statusBody = document.getElementById("statusBody");
+
+  const previewVideo = document.getElementById("previewVideo");
+  const connectedTitle = document.getElementById("connectedTitle");
+  const qualityDot = document.getElementById("qualityDot");
+  const qualityLabel = document.getElementById("qualityLabel");
+  const batteryLabel = document.getElementById("batteryLabel");
+  const cameraToggle = document.getElementById("cameraToggle");
+  const micToggle = document.getElementById("micToggle");
+  const cameraSub = document.getElementById("cameraSub");
+  const micSub = document.getElementById("micSub");
+  const switchCameraBtn = document.getElementById("switchCameraBtn");
+  const unpairBtn = document.getElementById("unpairBtn");
+
+  const fatalBody = document.getElementById("fatalBody");
+  const fatalRetryBtn = document.getElementById("fatalRetryBtn");
+
+  function showOnly(card) {
+    [scanCard, statusCard, connectedCard, fatalCard].forEach(c => c.classList.toggle("hidden", c !== card));
+  }
+
+  // ---------------------------------------------------------------------
+  // App state
+  // ---------------------------------------------------------------------
+  let ws = null;
+  let pc = null;
+  let localStream = null;
+  let scanStream = null;
+  let scanRafId = null;
+  let currentFacingMode = "user";
+  let streamCamera = true;
+  let streamMicrophone = true;
+  let sessionId = null;
+  let intentionalDisconnect = false;
+  let reconnectAttempt = 0;
+
+  function buildSignalingUrl(host, port) {
+    // See the top-of-file comment: an HTTPS-hosted page (Cloudflare Pages) cannot open a plain
+    // ws:// connection to a LAN device. Prefer wss:// whenever this page itself is HTTPS, so a
+    // future TLS-capable signaling endpoint "just works" without another code change here — but
+    // be honest that a plain ws:// TV (today's HubLink TV app) will fail from that context.
+    const scheme = location.protocol === "https:" ? "wss" : "ws";
+    return scheme + "://" + host + ":" + port;
+  }
+
+  // ---------------------------------------------------------------------
+  // QR scanning (rear camera) — runs only before pairing; its camera
+  // session is fully stopped before the call camera (front, by default)
+  // ever starts, same as both native companion apps.
+  // ---------------------------------------------------------------------
+  async function startQrScan() {
+    scanError.classList.add("hidden");
+    try {
+      scanStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" } },
+        audio: false
+      });
+    } catch (e) {
+      scanError.textContent = "Camera access was denied or is unavailable: " + e.message;
+      scanError.classList.remove("hidden");
+      return;
+    }
+    scanVideo.srcObject = scanStream;
+    requestCameraBtn.classList.add("hidden");
+
+    const ctx = scanCanvas.getContext("2d", { willReadFrequently: true });
+    const tick = () => {
+      if (scanVideo.readyState === scanVideo.HAVE_ENOUGH_DATA) {
+        scanCanvas.width = scanVideo.videoWidth;
+        scanCanvas.height = scanVideo.videoHeight;
+        ctx.drawImage(scanVideo, 0, 0, scanCanvas.width, scanCanvas.height);
+        const imageData = ctx.getImageData(0, 0, scanCanvas.width, scanCanvas.height);
+        const code = window.jsQR ? window.jsQR(imageData.data, imageData.width, imageData.height) : null;
+        if (code && code.data) {
+          const payload = decodePairingPayload(code.data);
+          if (payload) {
+            stopQrScan();
+            beginPairing(payload);
+            return;
+          }
+        }
+      }
+      scanRafId = requestAnimationFrame(tick);
+    };
+    scanRafId = requestAnimationFrame(tick);
+  }
+
+  function stopQrScan() {
+    if (scanRafId) cancelAnimationFrame(scanRafId);
+    scanRafId = null;
+    if (scanStream) { scanStream.getTracks().forEach(t => t.stop()); scanStream = null; }
+  }
+
+  requestCameraBtn.addEventListener("click", startQrScan);
+
+  // ---------------------------------------------------------------------
+  // Pairing + signaling
+  // ---------------------------------------------------------------------
+  function beginPairing(payload) {
+    intentionalDisconnect = false;
+    sessionId = payload.sessionId;
+    connect(payload.host, payload.port, payload.sessionId, payload.pairingToken, payload.tvDeviceName);
+  }
+
+  function reconnectIfPossible() {
+    const saved = loadCredential();
+    if (!saved) return false;
+    intentionalDisconnect = false;
+    sessionId = saved.sessionId;
+    connect(saved.host, saved.port, saved.sessionId, saved.reconnectToken, saved.tvDeviceName);
+    return true;
+  }
+
+  function connect(host, port, sid, token, tvName) {
+    showOnly(statusCard);
+    statusTitle.textContent = "Connecting to " + (tvName || "your TV") + "…";
+    statusBody.textContent = "";
+
+    let socket;
+    try {
+      socket = new WebSocket(buildSignalingUrl(host, port));
+    } catch (e) {
+      showFatal(mixedContentExplanation(host, port));
+      return;
+    }
+    ws = socket;
+
+    const failSafetyTimer = setTimeout(() => {
+      if (socket.readyState !== WebSocket.OPEN) {
+        showFatal(mixedContentExplanation(host, port));
+      }
+    }, 6000);
+
+    socket.onopen = () => {
+      clearTimeout(failSafetyTimer);
+      send({
+        type: MessageType.PAIRING_HELLO,
+        sessionId: sid,
+        pairingToken: token,
+        deviceName: guessDeviceName(),
+        platform: "IOS"
+      });
+    };
+
+    socket.onmessage = (event) => handleMessage(decode(event.data), host, port, sid, tvName);
+
+    socket.onclose = () => {
+      clearTimeout(failSafetyTimer);
+      if (!intentionalDisconnect) scheduleReconnect(host, port, tvName);
+    };
+
+    socket.onerror = () => { /* onclose fires right after; handled there */ };
+  }
+
+  function send(message) {
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(encode(message.type, message));
+  }
+
+  function mixedContentExplanation(host, port) {
+    if (location.protocol === "https:") {
+      return "This page is served over HTTPS (as Cloudflare Pages always does), and your " +
+        "TV's pairing server at " + host + ":" + port + " only speaks plain, unencrypted " +
+        "WebSocket (ws://). Browsers block that combination as mixed content — this is not a " +
+        "bug in this page, it's a deliberate browser security rule. See the comment at the top " +
+        "of this file's source for the two real fixes (TLS on the TV's signaling server, or a " +
+        "small cloud relay for just the signaling messages).";
+    }
+    return "Could not reach " + host + ":" + port + ". Make sure your phone and TV are on the " +
+      "same network and the QR code hasn't expired — try showing it again on the TV.";
+  }
+
+  function showFatal(message) {
+    fatalBody.textContent = message;
+    showOnly(fatalCard);
+  }
+
+  function scheduleReconnect(host, port, tvName) {
+    reconnectAttempt++;
+    showOnly(statusCard);
+    statusTitle.textContent = "Reconnecting to " + (tvName || "your TV") + "…";
+    statusBody.textContent = "Attempt " + reconnectAttempt;
+    const delay = Math.min(30000, 1000 * Math.pow(2, Math.min(reconnectAttempt, 5)));
+    setTimeout(() => {
+      const saved = loadCredential();
+      if (saved && !intentionalDisconnect) connect(saved.host, saved.port, saved.sessionId, saved.reconnectToken, saved.tvDeviceName);
+    }, delay);
+  }
+
+  async function handleMessage(message, host, port, sid, tvName) {
+    if (!message) return;
+    switch (message.type) {
+      case MessageType.PAIRING_ACCEPTED:
+        reconnectAttempt = 0;
+        saveCredential({
+          host: host, port: port, sessionId: sid,
+          reconnectToken: message.reconnectToken, tvDeviceName: message.tvDeviceName
+        });
+        await startCallAndOffer(message.tvDeviceName);
+        break;
+      case MessageType.PAIRING_REJECTED:
+        showFatal("Pairing was rejected: " + message.reason);
+        break;
+      case MessageType.SIGNALING_ANSWER:
+        if (pc) await pc.setRemoteDescription({ type: "answer", sdp: message.sdp });
+        break;
+      case MessageType.SIGNALING_ICE_CANDIDATE:
+        if (pc) {
+          try {
+            await pc.addIceCandidate({
+              candidate: message.candidate, sdpMid: message.sdpMid, sdpMLineIndex: message.sdpMLineIndex
+            });
+          } catch (e) { /* candidate may arrive after close; safe to ignore */ }
+        }
+        break;
+      case MessageType.DEVICE_SELECTION:
+        streamCamera = !!message.streamCamera;
+        streamMicrophone = !!message.streamMicrophone;
+        applyStreamingPreference();
+        break;
+      case MessageType.DISCONNECT:
+        teardown(false);
+        break;
+    }
+  }
+
+  // ---------------------------------------------------------------------
+  // WebRTC — always the offerer/sender, mirroring PhoneWebRtcEngine.kt.
+  // ---------------------------------------------------------------------
+  async function startCallAndOffer(tvName) {
+    localStream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: currentFacingMode },
+      audio: true
+    });
+    previewVideo.srcObject = localStream;
+    applyStreamingPreference();
+
+    pc = new RTCPeerConnection({ iceServers: [{ urls: "stun:stun.l.google.com:19302" }] });
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        send({
+          type: MessageType.SIGNALING_ICE_CANDIDATE,
+          sdpMid: event.candidate.sdpMid,
+          sdpMLineIndex: event.candidate.sdpMLineIndex,
+          candidate: event.candidate.candidate
+        });
+      }
+    };
+    pc.onconnectionstatechange = () => updateQualityFromState(pc.connectionState);
+
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    send({ type: MessageType.SIGNALING_OFFER, sdp: offer.sdp });
+
+    connectedTitle.textContent = "Connected to " + (tvName || "your TV");
+    showOnly(connectedCard);
+    startStatusReporting();
+  }
+
+  function applyStreamingPreference() {
+    if (!localStream) return;
+    localStream.getVideoTracks().forEach(t => t.enabled = streamCamera);
+    localStream.getAudioTracks().forEach(t => t.enabled = streamMicrophone);
+    cameraToggle.checked = streamCamera;
+    micToggle.checked = streamMicrophone;
+    cameraSub.textContent = streamCamera ? "Streaming to TV" : "Not needed right now";
+    micSub.textContent = streamMicrophone ? "Streaming to TV" : "Not needed right now";
+  }
+
+  cameraToggle.addEventListener("change", () => { streamCamera = cameraToggle.checked; applyStreamingPreference(); });
+  micToggle.addEventListener("change", () => { streamMicrophone = micToggle.checked; applyStreamingPreference(); });
+
+  switchCameraBtn.addEventListener("click", async () => {
+    currentFacingMode = currentFacingMode === "user" ? "environment" : "user";
+    if (!localStream || !pc) return;
+    const oldVideoTrack = localStream.getVideoTracks()[0];
+    const newStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: currentFacingMode }, audio: false });
+    const newVideoTrack = newStream.getVideoTracks()[0];
+    const sender = pc.getSenders().find(s => s.track && s.track.kind === "video");
+    if (sender) await sender.replaceTrack(newVideoTrack);
+    if (oldVideoTrack) { localStream.removeTrack(oldVideoTrack); oldVideoTrack.stop(); }
+    localStream.addTrack(newVideoTrack);
+    previewVideo.srcObject = localStream;
+    previewVideo.style.transform = currentFacingMode === "user" ? "scaleX(-1)" : "none";
+  });
+
+  unpairBtn.addEventListener("click", () => {
+    clearCredential();
+    teardown(true);
+  });
+
+  function updateQualityFromState(state) {
+    qualityDot.className = "status-dot " + (state === "connected" ? "ok" : state === "connecting" || state === "new" ? "warn" : "bad");
+    qualityLabel.textContent = state === "connected" ? "Good connection" : state === "connecting" ? "Connecting…" : "Connection issue";
+  }
+
+  // ---------------------------------------------------------------------
+  // Status reporting (battery + connection quality) — see the top-of-file
+  // rationale: iOS Safari doesn't expose navigator.getBattery at all (a
+  // deliberate WebKit privacy decision, not an oversight here), so battery
+  // is honestly reported as unavailable rather than a made-up number.
+  // ---------------------------------------------------------------------
+  let statusInterval = null;
+  function startStatusReporting() {
+    if (statusInterval) clearInterval(statusInterval);
+    const report = async () => {
+      let batteryPercent = -1;
+      let isCharging = false;
+      if (navigator.getBattery) {
+        try {
+          const battery = await navigator.getBattery();
+          batteryPercent = Math.round(battery.level * 100);
+          isCharging = battery.charging;
+          batteryLabel.textContent = batteryPercent + "% battery";
+        } catch (e) { batteryLabel.textContent = "Battery unavailable"; }
+      } else {
+        batteryLabel.textContent = "Battery unavailable";
+      }
+      send({
+        type: MessageType.DEVICE_STATUS,
+        batteryPercent: batteryPercent,
+        isCharging: isCharging,
+        hasFrontCamera: true,
+        hasBackCamera: true,
+        activeCameraFacing: streamCamera ? (currentFacingMode === "user" ? "FRONT" : "BACK") : null,
+        isMicMuted: !streamMicrophone,
+        connectionQuality: pc && pc.connectionState === "connected" ? "GOOD" : "POOR"
+      });
+    };
+    report();
+    statusInterval = setInterval(report, 5000);
+  }
+
+  function teardown(showScanAgain) {
+    intentionalDisconnect = true;
+    if (statusInterval) clearInterval(statusInterval);
+    if (ws) { try { ws.close(); } catch (e) {} ws = null; }
+    if (pc) { pc.close(); pc = null; }
+    if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
+    if (showScanAgain) {
+      showOnly(scanCard);
+      requestCameraBtn.classList.remove("hidden");
+    }
+  }
+
+  fatalRetryBtn.addEventListener("click", () => {
+    showOnly(scanCard);
+    requestCameraBtn.classList.remove("hidden");
+  });
+
+  function guessDeviceName() {
+    const ua = navigator.userAgent;
+    if (/iPhone/.test(ua)) return "iPhone";
+    if (/iPad/.test(ua)) return "iPad";
+    return "iOS device";
+  }
+
+  // ---------------------------------------------------------------------
+  // Entry point
+  // ---------------------------------------------------------------------
+  if (!reconnectIfPossible()) {
+    showOnly(scanCard);
+  }
+})();
+</script>
+</body>
+</html>
